@@ -5,7 +5,7 @@ on:
     # 5분마다 실행
     - cron: "*/5 * * * *"
 
-  # GitHub 화면에서 수동 실행 버튼을 만들기 위한 설정
+  # GitHub 화면에서 수동 실행 버튼
   workflow_dispatch:
 
 permissions:
@@ -21,10 +21,10 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -39,18 +39,11 @@ jobs:
           STATE_FILE: "seen_pages.json"
           REQUEST_TIMEOUT: "45"
 
-          # true: RSS 제목/요약에 생성 관련 문구가 있을 때만 알림
-          # false: 처음 보는 RSS 링크는 전부 알림
           REQUIRE_CREATION_KEYWORD: "true"
-
           CREATION_KEYWORDS: "created,new page,page created,created page,생성,새 페이지"
-
           EXCLUDE_PATTERNS: "/forum/,/system:,/category:,/tag:,/nav:,/admin:"
 
           DISCORD_USERNAME: "보카로 가사 위키 알림"
-
-          # 특정 역할을 멘션하고 싶으면 아래에 역할 ID를 넣기
-          # 예: "<@&123456789012345678>"
           DISCORD_MENTION: ""
 
         run: python notify_wikidot.py
