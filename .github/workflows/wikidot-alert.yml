@@ -3,12 +3,6 @@ name: Wikidot new page alert
 on:
   workflow_dispatch:
 
-  # 테스트 편의용입니다.
-  # Cloudflare 연동이 안정화되면 이 push 블록은 삭제해도 됩니다.
-  push:
-    branches:
-      - main
-
 permissions:
   contents: write
 
