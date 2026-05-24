@@ -3,6 +3,8 @@ name: Wikidot new page alert
 on:
   workflow_dispatch:
 
+  # 테스트 편의용입니다.
+  # Cloudflare 연동이 안정화되면 이 push 블록은 삭제해도 됩니다.
   push:
     branches:
       - main
@@ -37,6 +39,7 @@ jobs:
 
           STATE_FILE: "seen_pages.json"
           REQUEST_TIMEOUT: "60"
+          DISPLAY_TIMEZONE: "Asia/Tokyo"
 
           REQUIRE_CREATION_KEYWORD: "false"
           SEND_ON_FIRST_RUN: "false"
