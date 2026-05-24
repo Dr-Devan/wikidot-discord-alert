@@ -1,0 +1,69 @@
+name: Wikidot new page alert
+
+on:
+  schedule:
+    # 5분마다 실행
+    - cron: "*/5 * * * *"
+
+  # GitHub 화면에서 수동 실행 버튼을 만들기 위한 설정
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: wikidot-new-page-alert
+  cancel-in-progress: true
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Check Wikidot RSS and send Discord alert
+        env:
+          RSS_URL: "https://vocaro.wikidot.com/feed/site-changes.xml"
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+
+          STATE_FILE: "seen_pages.json"
+          REQUEST_TIMEOUT: "45"
+
+          # true: RSS 제목/요약에 생성 관련 문구가 있을 때만 알림
+          # false: 처음 보는 RSS 링크는 전부 알림
+          REQUIRE_CREATION_KEYWORD: "true"
+
+          CREATION_KEYWORDS: "created,new page,page created,created page,생성,새 페이지"
+
+          EXCLUDE_PATTERNS: "/forum/,/system:,/category:,/tag:,/nav:,/admin:"
+
+          DISCORD_USERNAME: "보카로 가사 위키 알림"
+
+          # 특정 역할을 멘션하고 싶으면 아래에 역할 ID를 넣기
+          # 예: "<@&123456789012345678>"
+          DISCORD_MENTION: ""
+
+        run: python notify_wikidot.py
+
+      - name: Commit seen state
+        run: |
+          if [[ -n "$(git status --porcelain seen_pages.json)" ]]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+            git add seen_pages.json
+            git commit -m "Update Wikidot RSS seen state"
+            git push
+          else
+            echo "No state changes to commit."
+          fi
