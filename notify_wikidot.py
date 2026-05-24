@@ -3,23 +3,32 @@ import json
 import os
 import re
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
+from bs4 import BeautifulSoup
 
 
 RSS_URL = os.environ.get(
     "RSS_URL",
-    "https://vocaro.wikidot.com/feed/site-changes.xml",
+    "http://vocaro.wikidot.com/feed/pages/pagename/recently-translated-lyrics/category/_default/tags/%EB%85%B8%EB%9E%98/order/created_at+desc/limit/100/t/%EB%B3%B4%EC%B9%B4%EB%A1%9C+%EA%B0%80%EC%82%AC+%EC%9C%84%ED%82%A4+%EC%B5%9C%EA%B7%BC+%EA%B0%80%EC%82%AC",
 ).strip()
 
 DISCORD_WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"].strip()
-STATE_FILE = os.environ.get("STATE_FILE", "seen_pages.json").strip()
 
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "45"))
+STATE_FILE = os.environ.get("STATE_FILE", "seen_pages.json").strip()
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "60"))
+DISPLAY_TIMEZONE = os.environ.get("DISPLAY_TIMEZONE", "Asia/Tokyo").strip()
 
 REQUIRE_CREATION_KEYWORD = (
-    os.environ.get("REQUIRE_CREATION_KEYWORD", "true").lower() == "true"
+    os.environ.get("REQUIRE_CREATION_KEYWORD", "false").lower() == "true"
+)
+
+SEND_ON_FIRST_RUN = (
+    os.environ.get("SEND_ON_FIRST_RUN", "false").lower() == "true"
 )
 
 CREATION_KEYWORDS = [
@@ -40,8 +49,40 @@ EXCLUDE_PATTERNS = [
     if item.strip()
 ]
 
-DISCORD_USERNAME = os.environ.get("DISCORD_USERNAME", "Wikidot 알림").strip()
+DISCORD_USERNAME = os.environ.get("DISCORD_USERNAME", "보카로 가사 위키 알림").strip()
 DISCORD_MENTION = os.environ.get("DISCORD_MENTION", "").strip()
+
+
+NICONICO_WATCH_RE = re.compile(
+    r'https?://(?:www\.)?nicovideo\.jp/watch/([a-z]{2}\d+)',
+    re.IGNORECASE,
+)
+
+NICONICO_EMBED_RE = re.compile(
+    r'https?://embed\.nicovideo\.jp/watch/([a-z]{2}\d+)',
+    re.IGNORECASE,
+)
+
+NICONICO_DATA_RE = re.compile(
+    r'data-attribute=["\']([a-z]{2}\d+)["\']',
+    re.IGNORECASE,
+)
+
+
+INFO_FIELD_RULES = {
+    "composer": {
+        "label": "작곡",
+        "classes": {"composer-cell"},
+    },
+    "writer": {
+        "label": "작사",
+        "classes": {"writer-cell"},
+    },
+    "vocals": {
+        "label": "노래",
+        "classes": {"vocaro-cell", "vocal-cell", "singer-cell"},
+    },
+}
 
 
 def now_iso():
@@ -56,6 +97,40 @@ def clean_text(value):
     value = re.sub(r"<[^>]+>", "", value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
+
+
+def escape_markdown_text(value):
+    """
+    Discord Markdown 링크 텍스트 안에서 깨질 수 있는 일부 문자를 이스케이프한다.
+    """
+    if not value:
+        return ""
+
+    replacements = {
+        "\\": "\\\\",
+        "[": "\\[",
+        "]": "\\]",
+        "(": "\\(",
+        ")": "\\)",
+    }
+
+    for src, dst in replacements.items():
+        value = value.replace(src, dst)
+
+    return value
+
+
+def markdown_link(text, url):
+    text = clean_text(text)
+    url = clean_text(url)
+
+    if not text:
+        return ""
+
+    if not url:
+        return escape_markdown_text(text)
+
+    return f"[{escape_markdown_text(text)}]({url})"
 
 
 def load_state():
@@ -87,14 +162,21 @@ def fetch_feed():
         "User-Agent": (
             "Mozilla/5.0 WikidotDiscordNotifier/1.0 "
             "(GitHub Actions RSS checker)"
-        )
+        ),
+        "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, */*",
     }
 
     response = requests.get(
         RSS_URL,
         headers=headers,
         timeout=REQUEST_TIMEOUT,
+        allow_redirects=True,
     )
+
+    print(f"[정보] HTTP status: {response.status_code}")
+    print(f"[정보] Final URL: {response.url}")
+    print(f"[정보] Response length: {len(response.content)} bytes")
+
     response.raise_for_status()
 
     feed = feedparser.parse(response.content)
@@ -102,20 +184,254 @@ def fetch_feed():
     if feed.bozo:
         print(f"[경고] RSS 파싱 경고: {feed.bozo_exception}")
 
+    print(f"[정보] RSS 항목 수: {len(feed.entries)}")
+
     return feed
 
 
+def pick_entry_link(entry):
+    candidates = [
+        entry.get("link", ""),
+        entry.get("id", ""),
+        entry.get("guid", ""),
+    ]
+
+    for candidate in candidates:
+        candidate = clean_text(candidate)
+
+        if not candidate:
+            continue
+
+        if candidate.startswith("http://") or candidate.startswith("https://"):
+            return candidate
+
+        if candidate.startswith("/"):
+            return urljoin(RSS_URL, candidate)
+
+    return ""
+
+
+def get_entry_html(entry):
+    parts = []
+
+    for key in ("summary", "description"):
+        value = entry.get(key, "")
+        if value:
+            parts.append(str(value))
+
+    content_items = entry.get("content", [])
+    if isinstance(content_items, list):
+        for item in content_items:
+            value = item.get("value", "")
+            if value:
+                parts.append(str(value))
+
+    return "\n".join(parts)
+
+
+def extract_original_source(raw_html):
+    """
+    니코니코 원본 링크를 추출한다.
+
+    예:
+    href="http://www.nicovideo.jp/watch/sm35202505"
+    → ("sm35202505", "http://www.nicovideo.jp/watch/sm35202505")
+    """
+
+    if not raw_html:
+        return None, None
+
+    decoded = html.unescape(raw_html)
+
+    match = NICONICO_WATCH_RE.search(decoded)
+    if match:
+        source_id = match.group(1)
+        return source_id, f"http://www.nicovideo.jp/watch/{source_id}"
+
+    match = NICONICO_EMBED_RE.search(decoded)
+    if match:
+        source_id = match.group(1)
+        return source_id, f"http://www.nicovideo.jp/watch/{source_id}"
+
+    match = NICONICO_DATA_RE.search(decoded)
+    if match:
+        source_id = match.group(1)
+        return source_id, f"http://www.nicovideo.jp/watch/{source_id}"
+
+    return None, None
+
+
+def parse_cell_items(td):
+    """
+    <td> 안의 링크들을 Discord Markdown 링크 목록으로 변환한다.
+    링크가 없으면 텍스트만 반환한다.
+    """
+
+    if td is None:
+        return []
+
+    items = []
+    seen = set()
+
+    for a in td.find_all("a"):
+        text = clean_text(a.get_text(" ", strip=True))
+        href = clean_text(a.get("href", ""))
+
+        if not text:
+            continue
+
+        if href.startswith("javascript:"):
+            href = ""
+
+        if href:
+            href = urljoin(RSS_URL, href)
+
+        key = (text, href)
+        if key in seen:
+            continue
+
+        seen.add(key)
+        items.append({
+            "text": text,
+            "url": href,
+        })
+
+    if items:
+        return items
+
+    fallback_text = clean_text(td.get_text(" ", strip=True))
+    if fallback_text:
+        return [{
+            "text": fallback_text,
+            "url": "",
+        }]
+
+    return []
+
+
+def match_info_field(th):
+    if th is None:
+        return None
+
+    th_text = clean_text(th.get_text(" ", strip=True))
+    th_classes = set(th.get("class", []))
+
+    for field_key, rule in INFO_FIELD_RULES.items():
+        label = rule["label"]
+        classes = rule["classes"]
+
+        if label and th_text == label:
+            return field_key
+
+        if th_classes & classes:
+            return field_key
+
+    return None
+
+
+def extract_info_fields(raw_html):
+    """
+    Wikidot 정보 테이블에서 작곡/작사/노래 정보를 추출한다.
+
+    반환 예:
+    {
+        "composer": [{"text": "Crusher", "url": "http://vocaro.wikidot.com/artist:crusher"}],
+        "writer": [{"text": "Crusher", "url": "http://vocaro.wikidot.com/artist:crusher"}],
+        "vocals": [{"text": "하츠네 미쿠 English", "url": "http://vocaro.wikidot.com/hatsune-miku"}]
+    }
+    """
+
+    result = {
+        "composer": [],
+        "writer": [],
+        "vocals": [],
+    }
+
+    if not raw_html:
+        return result
+
+    decoded = html.unescape(raw_html)
+    soup = BeautifulSoup(decoded, "html.parser")
+
+    for tr in soup.find_all("tr"):
+        th = tr.find("th")
+        td = tr.find("td")
+
+        field_key = match_info_field(th)
+
+        if not field_key:
+            continue
+
+        items = parse_cell_items(td)
+
+        if items:
+            result[field_key] = items
+
+    return result
+
+
+def format_info_items(items):
+    if not items:
+        return ""
+
+    formatted = []
+
+    for item in items:
+        text = item.get("text", "")
+        url = item.get("url", "")
+        value = markdown_link(text, url)
+
+        if value:
+            formatted.append(value)
+
+    return ", ".join(formatted)
+
+
+def format_pubdate(pubdate):
+    """
+    RSS pubDate를 yyyy.mm.dd hh:mm 형식으로 변환한다.
+    DISPLAY_TIMEZONE 기본값은 Asia/Tokyo.
+    """
+
+    if not pubdate:
+        return ""
+
+    try:
+        dt = parsedate_to_datetime(pubdate)
+
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        dt = dt.astimezone(ZoneInfo(DISPLAY_TIMEZONE))
+        return dt.strftime("%Y.%m.%d %H:%M")
+
+    except Exception as exc:
+        print(f"[경고] pubDate 변환 실패: {pubdate} / {exc}")
+        return clean_text(pubdate)
+
+
 def normalize_entry(entry):
-    link = clean_text(entry.get("link", ""))
-    title = clean_text(entry.get("title", ""))
-    summary = clean_text(entry.get("summary", "") or entry.get("description", ""))
-    published = clean_text(entry.get("published", "") or entry.get("updated", ""))
+    raw_html = get_entry_html(entry)
+    source_id, source_url = extract_original_source(raw_html)
+    info_fields = extract_info_fields(raw_html)
+
+    pubdate = clean_text(
+        entry.get("published", "")
+        or entry.get("updated", "")
+    )
 
     return {
-        "link": link,
-        "title": title,
-        "summary": summary,
-        "published": published,
+        "link": pick_entry_link(entry),
+        "title": clean_text(entry.get("title", "")),
+        "summary": clean_text(entry.get("summary", "") or entry.get("description", "")),
+        "published": pubdate,
+        "published_display": format_pubdate(pubdate),
+        "raw_html": raw_html,
+        "source_id": source_id,
+        "source_url": source_url,
+        "composer_items": info_fields.get("composer", []),
+        "writer_items": info_fields.get("writer", []),
+        "vocal_items": info_fields.get("vocals", []),
     }
 
 
@@ -132,24 +448,58 @@ def looks_like_created_page(entry):
     return any(keyword in text for keyword in CREATION_KEYWORDS)
 
 
+def build_embed_description(entry):
+    lines = []
+
+    if entry.get("source_id") and entry.get("source_url"):
+        lines.append(f"원본: {markdown_link(entry['source_id'], entry['source_url'])}")
+
+    if entry.get("published_display"):
+        lines.append(f"작성일: {entry['published_display']}")
+
+    info_lines = []
+
+    composer = format_info_items(entry.get("composer_items", []))
+    writer = format_info_items(entry.get("writer_items", []))
+    vocals = format_info_items(entry.get("vocal_items", []))
+
+    if composer:
+        info_lines.append(f"작곡: {composer}")
+
+    if writer:
+        info_lines.append(f"작사: {writer}")
+
+    if vocals:
+        info_lines.append(f"노래: {vocals}")
+
+    if info_lines:
+        if lines:
+            lines.append("")
+        lines.append("**정보**")
+        lines.extend(info_lines)
+
+    if entry.get("link"):
+        lines.append("")
+        lines.append(f"🔗 {markdown_link('가사 페이지 열기', entry['link'])}")
+
+    return "\n".join(lines)
+
+
 def send_to_discord(entry):
     title = entry["title"] or "새 Wikidot 페이지"
     link = entry["link"]
-    summary = entry["summary"]
-
-    description = summary[:800] if summary else "새 페이지가 생성된 것으로 감지되었습니다."
 
     payload = {
         "username": DISCORD_USERNAME,
         "content": DISCORD_MENTION or None,
         "embeds": [
             {
-                "title": title[:256],
+                "title": f"🎵 {title}"[:256],
                 "url": link,
-                "description": f"{description}\n\n[페이지 열기]({link})",
+                "description": build_embed_description(entry)[:4096],
                 "color": 0x4DB6AC,
                 "footer": {
-                    "text": "Wikidot RSS"
+                    "text": "보카로 가사 위키 최근 가사"
                 },
                 "timestamp": now_iso(),
             }
@@ -161,6 +511,8 @@ def send_to_discord(entry):
         json=payload,
         timeout=20,
     )
+
+    print(f"[정보] Discord status: {response.status_code}")
     response.raise_for_status()
 
 
@@ -174,14 +526,21 @@ def main():
     state = load_state()
     first_run = not state.get("initialized", False)
 
+    print(f"[정보] initialized: {state.get('initialized', False)}")
+    print(f"[정보] 기존 seen_links 수: {len(state.get('seen_links', []))}")
+
     seen_links = list(state["seen_links"])
     seen_set = set(seen_links)
 
     feed = fetch_feed()
+
+    if len(feed.entries) == 0:
+        raise RuntimeError("RSS entries are empty")
+
     entries = [normalize_entry(entry) for entry in feed.entries]
     entries = [entry for entry in entries if entry["link"]]
 
-    print(f"[정보] RSS 항목 수: {len(entries)}")
+    print(f"[정보] link가 있는 RSS 항목 수: {len(entries)}")
 
     changed = False
     alerts = []
@@ -197,7 +556,7 @@ def main():
         seen_set.add(link)
         changed = True
 
-        if first_run:
+        if first_run and not SEND_ON_FIRST_RUN:
             print(f"[초기화] 기존 항목 저장만 함: {entry['title']} / {link}")
             continue
 
@@ -207,18 +566,22 @@ def main():
 
         if not looks_like_created_page(entry):
             print(f"[제외] 생성 이벤트로 판단되지 않음: {entry['title']} / {link}")
-            print(f"       summary: {entry['summary'][:300]}")
             continue
 
         alerts.append(entry)
 
-    if first_run:
+    if first_run and not SEND_ON_FIRST_RUN:
         print("[완료] 첫 실행이므로 기존 RSS 항목은 알림하지 않고 저장만 했습니다.")
     elif not alerts:
         print("[완료] 새 페이지 알림 대상 없음")
     else:
         for entry in alerts:
             print(f"[전송] Discord 알림: {entry['title']} / {entry['link']}")
+            print(f"       원본: {entry.get('source_id')}")
+            print(f"       작성일: {entry.get('published_display')}")
+            print(f"       작곡: {format_info_items(entry.get('composer_items', []))}")
+            print(f"       작사: {format_info_items(entry.get('writer_items', []))}")
+            print(f"       노래: {format_info_items(entry.get('vocal_items', []))}")
             send_to_discord(entry)
 
         print(f"[완료] Discord 알림 {len(alerts)}건 전송")
