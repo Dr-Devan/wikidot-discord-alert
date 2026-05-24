@@ -2,10 +2,10 @@ name: Wikidot new page alert
 
 on:
   schedule:
-    # 5분마다 실행
+    # Runs every 5 minutes
     - cron: "*/5 * * * *"
 
-  # GitHub 화면에서 수동 실행 버튼
+  # Run workflow button
   workflow_dispatch:
 
 permissions:
@@ -33,13 +33,15 @@ jobs:
 
       - name: Check Wikidot RSS and send Discord alert
         env:
-          RSS_URL: "https://vocaro.wikidot.com/feed/site-changes.xml"
+          RSS_URL: "http://vocaro.wikidot.com/feed/pages/pagename/recently-translated-lyrics/category/_default/tags/%EB%85%B8%EB%9E%98/order/created_at+desc/limit/100/t/%EB%B3%B4%EC%B9%B4%EB%A1%9C+%EA%B0%80%EC%82%AC+%EC%9C%84%ED%82%A4+%EC%B5%9C%EA%B7%BC+%EA%B0%80%EC%82%AC"
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
 
           STATE_FILE: "seen_pages.json"
-          REQUEST_TIMEOUT: "45"
+          REQUEST_TIMEOUT: "60"
 
-          REQUIRE_CREATION_KEYWORD: "true"
+          REQUIRE_CREATION_KEYWORD: "false"
+          SEND_ON_FIRST_RUN: "false"
+
           CREATION_KEYWORDS: "created,new page,page created,created page,생성,새 페이지"
           EXCLUDE_PATTERNS: "/forum/,/system:,/category:,/tag:,/nav:,/admin:"
 
