@@ -2,12 +2,14 @@ name: Wikidot new page alert
 
 on:
   schedule:
-    # Runs every 5 minutes
     - cron: "2-59/5 * * * *"
 
-  # Run workflow button
   workflow_dispatch:
 
+  push:
+    branches:
+      - main
+      
 permissions:
   contents: write
 
