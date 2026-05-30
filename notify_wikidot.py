@@ -4,7 +4,7 @@ import os
 import re
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse, parse_qs
 from zoneinfo import ZoneInfo
 
 import feedparser
@@ -53,19 +53,13 @@ DISCORD_USERNAME = os.environ.get("DISCORD_USERNAME", "보카로 가사 위키 �
 DISCORD_MENTION = os.environ.get("DISCORD_MENTION", "").strip()
 
 
-NICONICO_WATCH_RE = re.compile(
-    r'https?://(?:www\.)?nicovideo\.jp/watch/([a-z]{2}\d+)',
+NICONICO_ID_RE = re.compile(
+    r"\b([a-z]{2}\d+)\b",
     re.IGNORECASE,
 )
 
-NICONICO_EMBED_RE = re.compile(
-    r'https?://embed\.nicovideo\.jp/watch/([a-z]{2}\d+)',
-    re.IGNORECASE,
-)
-
-NICONICO_DATA_RE = re.compile(
-    r'data-attribute=["\']([a-z]{2}\d+)["\']',
-    re.IGNORECASE,
+YOUTUBE_ID_RE = re.compile(
+    r"\b([A-Za-z0-9_-]{11})\b"
 )
 
 
@@ -229,34 +223,160 @@ def get_entry_html(entry):
     return "\n".join(parts)
 
 
+def extract_niconico_id_from_url(url):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path
+
+    if "nicovideo.jp" not in host:
+        return None
+
+    # http://www.nicovideo.jp/watch/sm35202505
+    # https://embed.nicovideo.jp/watch/sm35202505
+    match = re.search(r"/watch/([a-z]{2}\d+)", path, re.IGNORECASE)
+
+    if match:
+        return match.group(1)
+
+    return None
+
+
+def extract_youtube_id_from_url(url):
+    parsed = urlparse(url)
+    host = parsed.netloc.lower()
+    path = parsed.path
+    query = parse_qs(parsed.query)
+
+    # https://www.youtube.com/watch?v=xxxxxxxxxxx
+    if "youtube.com" in host or "youtube-nocookie.com" in host:
+        video_ids = query.get("v")
+
+        if video_ids:
+            candidate = video_ids[0]
+            if YOUTUBE_ID_RE.fullmatch(candidate):
+                return candidate
+
+        # https://www.youtube.com/embed/xxxxxxxxxxx
+        # https://www.youtube-nocookie.com/embed/xxxxxxxxxxx
+        match = re.search(r"/embed/([A-Za-z0-9_-]{11})", path)
+
+        if match:
+            return match.group(1)
+
+        # https://www.youtube.com/shorts/xxxxxxxxxxx
+        match = re.search(r"/shorts/([A-Za-z0-9_-]{11})", path)
+
+        if match:
+            return match.group(1)
+
+    # https://youtu.be/xxxxxxxxxxx
+    if "youtu.be" in host:
+        candidate = path.strip("/").split("/")[0]
+
+        if YOUTUBE_ID_RE.fullmatch(candidate):
+            return candidate
+
+    return None
+
+
+def normalize_original_source_from_url(url):
+    url = clean_text(url)
+
+    if not url:
+        return None, None
+
+    niconico_id = extract_niconico_id_from_url(url)
+    if niconico_id:
+        return niconico_id, f"http://www.nicovideo.jp/watch/{niconico_id}"
+
+    youtube_id = extract_youtube_id_from_url(url)
+    if youtube_id:
+        return youtube_id, f"https://www.youtube.com/watch?v={youtube_id}"
+
+    return None, None
+
+
 def extract_original_source(raw_html):
     """
-    니코니코 원본 링크를 추출한다.
+    원본 출처 링크를 추출한다.
 
-    예:
-    href="http://www.nicovideo.jp/watch/sm35202505"
-    → ("sm35202505", "http://www.nicovideo.jp/watch/sm35202505")
+    지원:
+    - NicoNico: http://www.nicovideo.jp/watch/sm35202505
+    - NicoNico embed: https://embed.nicovideo.jp/watch/sm35202505
+    - YouTube: https://www.youtube.com/watch?v=xxxxxxxxxxx
+    - YouTube short: https://youtu.be/xxxxxxxxxxx
+    - YouTube embed: https://www.youtube.com/embed/xxxxxxxxxxx
+    - YouTube nocookie embed: https://www.youtube-nocookie.com/embed/xxxxxxxxxxx
     """
 
     if not raw_html:
         return None, None
 
     decoded = html.unescape(raw_html)
+    soup = BeautifulSoup(decoded, "html.parser")
 
-    match = NICONICO_WATCH_RE.search(decoded)
-    if match:
-        source_id = match.group(1)
+    # 1. 정보표의 <a href="...">에서 먼저 찾기
+    for a in soup.find_all("a"):
+        href = clean_text(a.get("href", ""))
+
+        if not href:
+            continue
+
+        source_id, source_url = normalize_original_source_from_url(href)
+
+        if source_id and source_url:
+            return source_id, source_url
+
+    # 2. iframe src 등 HTML 전체 URL에서 찾기
+    for tag in soup.find_all(["iframe", "embed", "source"]):
+        src = clean_text(tag.get("src", ""))
+
+        if not src:
+            continue
+
+        source_id, source_url = normalize_original_source_from_url(src)
+
+        if source_id and source_url:
+            return source_id, source_url
+
+    # 3. data-attribute="sm35202505" 또는 data-attribute="YouTubeID" 대응
+    for tag in soup.find_all(attrs={"data-attribute": True}):
+        value = clean_text(tag.get("data-attribute", ""))
+
+        if not value:
+            continue
+
+        if NICONICO_ID_RE.fullmatch(value):
+            return value, f"http://www.nicovideo.jp/watch/{value}"
+
+        if YOUTUBE_ID_RE.fullmatch(value):
+            return value, f"https://www.youtube.com/watch?v={value}"
+
+    # 4. 최후 fallback: raw HTML 문자열에서 직접 검색
+    niconico_match = re.search(
+        r"https?://(?:www\.|embed\.)?nicovideo\.jp/watch/([a-z]{2}\d+)",
+        decoded,
+        re.IGNORECASE,
+    )
+
+    if niconico_match:
+        source_id = niconico_match.group(1)
         return source_id, f"http://www.nicovideo.jp/watch/{source_id}"
 
-    match = NICONICO_EMBED_RE.search(decoded)
-    if match:
-        source_id = match.group(1)
-        return source_id, f"http://www.nicovideo.jp/watch/{source_id}"
+    youtube_patterns = [
+        r"https?://(?:www\.)?youtube\.com/watch\?[^\"'\s<>]*v=([A-Za-z0-9_-]{11})",
+        r"https?://youtu\.be/([A-Za-z0-9_-]{11})",
+        r"https?://(?:www\.)?youtube\.com/embed/([A-Za-z0-9_-]{11})",
+        r"https?://(?:www\.)?youtube-nocookie\.com/embed/([A-Za-z0-9_-]{11})",
+        r"https?://(?:www\.)?youtube\.com/shorts/([A-Za-z0-9_-]{11})",
+    ]
 
-    match = NICONICO_DATA_RE.search(decoded)
-    if match:
-        source_id = match.group(1)
-        return source_id, f"http://www.nicovideo.jp/watch/{source_id}"
+    for pattern in youtube_patterns:
+        match = re.search(pattern, decoded, re.IGNORECASE)
+
+        if match:
+            source_id = match.group(1)
+            return source_id, f"https://www.youtube.com/watch?v={source_id}"
 
     return None, None
 
